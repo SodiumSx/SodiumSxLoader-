@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="robots" content="noindex" />
+    <title>FreeHub — hub script miễn phí, không key</title>
+    <link rel="stylesheet" href="/style.css" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%237c5cff'/%3E%3Cpath d='M10 22V10h12v3h-9v2h7v3h-7v4z' fill='%23fff'/%3E%3C/svg%3E"
+    />
+  </head>
+  <body>
+    <div class="glow" aria-hidden="true"></div>
+    <header class="top">
+      <div class="brand">
+        <span class="mark">F</span>
+        <div>
+          <h1 id="hub-name">FreeHub</h1>
+          <p id="hub-tagline" class="tagline">No key. No HWID. No login.</p>
+        </div>
+      </div>
+      <div class="pills">
+        <span class="pill ok">100% free</span>
+        <span class="pill">keyless</span>
+        <span class="pill">VM 2 lớp</span>
+      </div>
+    </header>
+
+    <section class="hero">
+      <h2>Chọn script, copy raw link, dán vào executor.</h2>
+      <div class="code-card">
+        <code id="usage">loadstring(game:HttpGet("https://.../api/r/&lt;id&gt;"))()</code>
+        <button id="copy-usage" class="ghost" type="button">Copy</button>
+      </div>
+      <p class="hint">
+        Link raw chỉ trả về đúng một dòng <code>loadstring</code> — không lộ source. Loader tự xin
+        challenge, giải proof-of-work, xác thực phiên rồi mới nhận payload được mã hoá theo phiên.
+      </p>
+    </section>
+
+    <main>
+      <div class="list-head">
+        <h3>Scripts</h3>
+        <span id="build" class="muted">build …</span>
+      </div>
+      <div id="scripts" class="grid" aria-live="polite"></div>
+      <p id="empty" class="empty" hidden>Chưa có script nào. Thêm vào <code>hub.config.json</code> rồi chạy build.</p>
+    </main>
+
+    <section class="notes">
+      <h3>Bảo vệ đang bật</h3>
+      <ul>
+        <li>Anti-hook <code>loadstring</code> / native bị bọc bởi Lua closure</li>
+        <li>Anti env-log: phát hiện <code>__namecall</code>, proxy <code>getgenv</code>, debug hook</li>
+        <li>Anti-tamper: MAC khoá theo phiên + kiểm tra độ dài payload</li>
+        <li>Anti-bot: proof-of-work + fingerprint executor + chặn client tự động</li>
+        <li>Anti-curl: payload không có token hợp lệ thì trả 401, mỗi phiên một chương trình VM mới</li>
+      </ul>
+      <p class="muted small">
+        Hub chạy trên Vercel, không cần database. Source server không bao giờ gửi xuống client; client
+        chỉ nhận chương trình VM đã mã hoá.
+      </p>
+    </section>
+
+    <footer>
+      <span id="footer-name">FreeHub</span> · build <span id="footer-build">…</span>
+    </footer>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>

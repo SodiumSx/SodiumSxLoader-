@@ -1,0 +1,18 @@
+{
+  "name": "freehub-guard",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Free, keyless Roblox script hub loader with VM obfuscation, signed delivery and runtime anti-tamper",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node tools/build.mjs",
+    "dev": "node tools/build.mjs && node tools/dev.mjs",
+    "test": "node tools/build.mjs && node tools/test.mjs"
+  },
+  "devDependencies": {
+    "wasmoon": "^1.16.0"
+  }
+}

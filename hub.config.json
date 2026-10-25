@@ -1,0 +1,24 @@
+{
+  "name": "FreeHub",
+  "tagline": "Free, keyless script hub. No license, no HWID, no login.",
+  "scripts": [
+    {
+      "id": "example",
+      "file": "scripts/example.lua",
+      "name": "Example Panel",
+      "description": "Script demo tối giản: thông báo + panel kéo được. Thay bằng payload của bạn.",
+      "author": "FreeHub",
+      "version": "1.0.0",
+      "tags": ["demo", "ui"]
+    },
+    {
+      "id": "utilities",
+      "file": "scripts/utilities.lua",
+      "name": "Server Utilities",
+      "description": "Thông tin server, copy job id, ping và refresh trong một panel nhỏ.",
+      "author": "FreeHub",
+      "version": "1.0.0",
+      "tags": ["utility", "server"]
+    }
+  ]
+}
