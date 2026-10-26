@@ -17,8 +17,10 @@ delete process.env.HUB_ALLOWED_HOSTS;
 
 const { obfuscateLua } = await import("../lib/lua-obfuscate.mjs");
 const { compileVm, makeRng } = await import("../lib/vm.mjs");
-const { sessionKeyWords, keyWordsToHex } = await import("../lib/crypto.mjs");
-const { POW_BITS, signToken, stageTtlMs } = await import("../lib/token.mjs");
+const { sessionKeyWords, keyWordsToHex, leadingZeroBits, sha256Hex } = await import(
+  "../lib/crypto.mjs"
+);
+const { POW_BITS, signToken, stageTtlMs, powChallenge } = await import("../lib/token.mjs");
 const { masterSecret } = await import("../lib/secret.mjs");
 
 const BIT32_SHIM = `
@@ -240,7 +242,7 @@ await check("stage requires a fresh ticket", async () => {
 
 await check("stage ticket dies in seconds, not minutes", async () => {
   const ttl = stageTtlMs();
-  assert.ok(ttl <= 5_000, `stage ticket should live ~2s, got ${ttl}ms`);
+  assert.ok(ttl <= 5_000, `stage ticket should live ~5s, got ${ttl}ms`);
   const master = masterSecret();
   const now = Date.now();
   const stale = signToken(master, { kind: "stage", sid: "example", iat: now - 60_000, exp: now - 1_000 });
@@ -287,8 +289,20 @@ await check("session rejects automated clients", async () => {
 
 await check("session rejects unsolved proof-of-work", async () => {
   const nonce = "1".repeat(32);
+  const master = masterSecret();
+  // A fixed `w` has a 1/2^bits chance of actually being a solution — at 7 bits
+  // that made this check fail once every ~64 runs. Pick a value that is provably
+  // unsolved for the previous, current and next step instead.
+  const step = Math.floor(Date.now() / 120_000);
+  const solved = (w) =>
+    [step - 1, step, step + 1].some(
+      (s) => leadingZeroBits(sha256Hex(`${powChallenge(master, "example", nonce, s)}:${w}`)) >= POW_BITS,
+    );
+  let wrong = -1;
+  for (let w = 0; w < 8192 && wrong < 0; w++) if (!solved(w)) wrong = w;
+  assert.ok(wrong >= 0, "could not find an unsolved value");
   const response = await fetch(
-    `${BASE}/api/session?id=example&n=${nonce}&w=1&e=Delta&p=123`,
+    `${BASE}/api/session?id=example&n=${nonce}&w=${wrong}&e=Delta&p=123`,
   );
   assert.equal(response.status, 403);
 });
