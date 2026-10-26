@@ -7,7 +7,7 @@ import { openToken } from "../../lib/token.mjs";
 /**
  * Layer 1: the loader core, VM-compiled and re-randomized on every request.
  * Requires the short-lived ticket from the raw link, so hotlinking a stage URL
- * from another hub or a scraper cache fails after two minutes.
+ * from another hub or a scraper cache fails after ~20 seconds.
  */
 export default function handler(req, res) {
   const id = param(req);
