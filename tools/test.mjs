@@ -18,7 +18,8 @@ delete process.env.HUB_ALLOWED_HOSTS;
 const { obfuscateLua } = await import("../lib/lua-obfuscate.mjs");
 const { compileVm, makeRng } = await import("../lib/vm.mjs");
 const { sessionKeyWords, keyWordsToHex } = await import("../lib/crypto.mjs");
-const { POW_BITS } = await import("../lib/token.mjs");
+const { POW_BITS, signToken, stageTtlMs } = await import("../lib/token.mjs");
+const { masterSecret } = await import("../lib/secret.mjs");
 
 const BIT32_SHIM = `
 bit32 = {
@@ -235,6 +236,17 @@ await check("hub metadata is public but carries no payload", async () => {
 await check("stage requires a fresh ticket", async () => {
   assert.equal((await fetch(`${BASE}/api/stage/example`)).status, 403);
   assert.equal((await fetch(`${BASE}/api/stage/example?s=abc.def`)).status, 403);
+});
+
+await check("stage ticket dies in seconds, not minutes", async () => {
+  const ttl = stageTtlMs();
+  assert.ok(ttl <= 30_000, `stage ticket should live <= 30s, got ${ttl}ms`);
+  const master = masterSecret();
+  const now = Date.now();
+  const stale = signToken(master, { kind: "stage", sid: "example", iat: now - 60_000, exp: now - 1_000 });
+  assert.equal((await fetch(`${BASE}/api/stage/example?s=${stale}`)).status, 403, "old ticket");
+  const fresh = signToken(master, { kind: "stage", sid: "example", iat: now, exp: now + ttl });
+  assert.equal((await fetch(`${BASE}/api/stage/example?s=${fresh}`)).status, 200, "fresh ticket");
 });
 
 await check("stage responses are randomized per request", async () => {
