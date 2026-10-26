@@ -140,6 +140,31 @@ await check("raw link is a single loadstring line and leaks nothing", async () =
   assert.ok(!body.includes("HttpService"), "raw must not contain payload");
 });
 
+await check("browser visits to the raw link only get a black screen", async () => {
+  for (const headers of [
+    {
+      "user-agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "sec-fetch-mode": "navigate",
+      "sec-ch-ua": '"Chromium";v="126"',
+    },
+    { "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 Safari/604.1" },
+    { accept: "text/html" },
+  ]) {
+    const response = await fetch(`${BASE}/api/r/example`, { headers });
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get("content-type"), /text\/html/);
+    const body = await response.text();
+    assert.ok(!body.includes("loadstring"), "browser page must not contain the bootstrap");
+    assert.ok(!body.includes("/api/stage/"), "browser page must not leak a stage url");
+    assert.match(body, /background:\s*#000/, "page must be black");
+  }
+
+  const bot = await fetch(`${BASE}/api/r/example`, { headers: { "user-agent": "Roblox/WinInet" } });
+  assert.match(await bot.text(), /^loadstring\(game:HttpGet\(/, "executors still get the bootstrap");
+});
+
 await check("unknown script ids 404", async () => {
   for (const path of ["r", "stage", "payload"]) {
     const response = await fetch(`${BASE}/api/${path}/does-not-exist`);
