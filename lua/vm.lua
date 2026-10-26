@@ -132,9 +132,44 @@ local function vm_mac(data, k)
     parts[i] = table.concat(buf)
   end
   return table.concat(parts)
+end-- Native runner + guard live inside the VM so the delivered stub has no
+-- top-level "decode then load" line to patch. `vm_native` rejects any loader or
+-- string helper that was replaced by a Lua closure (env loggers, hook tools).
+local vm_load = loadstring or load
+
+-- Luau spells it debug.info(fn, "s") and returns the source directly; stock Lua
+-- spells it debug.getinfo(fn, "S") and returns a table. Try both.
+local function vm_src(fn)
+  local d = debug
+  if not d then return nil end
+  local gi = d.info or d.getinfo
+  if not gi then return nil end
+  for _, what in ipairs({ "S", "s" }) do
+    local ok, info = pcall(gi, fn, what)
+    if ok then
+      if type(info) == "table" then info = info.source end
+      if type(info) == "string" then return info end
+    end
+  end
+  return nil
 end
 
-local function vm_run(program, keyhex, maxSteps)
+local function vm_native(fn)
+  if type(fn) ~= "function" then return false end
+  local src = vm_src(fn)
+  if not src then return false end
+  return src == "[C]" or src == "=[C]"
+end
+
+local function vm_chunkname()
+  return "=" .. string.format("%x", math.random(1, 2147483646))
+end
+
+local vm_run
+
+vm_run = function (program, keyhex, maxSteps, depth)
+  depth = depth or 1
+  if depth > 6 then return nil end
   if type(program) ~= "string" or type(keyhex) ~= "string" or #keyhex < 32 then
     return nil
   end
@@ -225,10 +260,37 @@ local function vm_run(program, keyhex, maxSteps)
       if regs[f[2]] then nextpc = f[3] end
     elseif op == 10 then
       return regs[f[2]]
+    elseif op == 11 then
+      -- EXEC: run the decoded source inside the VM and never hand it back.
+      local src = regs[f[2]]
+      if type(src) ~= "string" or #src < 24 then return nil end
+      if not vm_native(vm_load) then return nil end
+      local ok, fn = pcall(vm_load, src, vm_chunkname())
+      if not ok or type(fn) ~= "function" then return nil end
+      if not pcall(fn) then return nil end
+      return "\1"
+    elseif op == 12 then
+      -- NEST: run the embedded program with a key derived from parent key + salt.
+      local sub = regs[f[2]]
+      local salt = regs[f[3]]
+      if type(sub) ~= "string" or type(salt) ~= "string" then return nil end
+      local childKey = vm_mac(salt, key)
+      return vm_run(sub, childKey, nil, depth + 1)
     else
       return nil
     end
 
     pc = nextpc
   end
+end
+
+-- Entry point used by the raw link. Fails closed: a hooked loadstring/string
+-- helper, or a program that does not end in EXEC, produces no execution at all.
+local function vm_boot(program, keyhex)
+  if type(program) ~= "string" or type(keyhex) ~= "string" or #keyhex < 32 then return end
+  if not vm_native(vm_load) then return end
+  if not vm_native(string.char) then return end
+  if not vm_native(string.sub) then return end
+  if not vm_native(table.concat) then return end
+  if vm_run(program, keyhex, nil, 1) == nil then return end
 end

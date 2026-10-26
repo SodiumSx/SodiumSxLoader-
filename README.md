@@ -13,7 +13,7 @@ Trình duyệt thấy: màn hình đen, không có loadstring lẫn source
 | Thành phần | Mô tả |
 | --- | --- |
 | `api/r/[id].js` | Raw link — trình duyệt/bot thấy màn đen, executor nhận stub đã obfuscate (không còn dòng `loadstring(game:HttpGet(...))` đọc được) |
-| `lua/stub.tpl`, `lib/stub.mjs` | Stub raw link: VM-pack + mã hoá string, sinh lại ngẫu nhiên mỗi request |
+| `lua/stub.tpl`, `lib/stub.mjs` | Stub raw link: VM đổi tên biến + 2–4 lớp chương trình lồng nhau, key suy ra trong VM, sinh lại ngẫu nhiên mỗi request |
 | `api/stage/[id].js` | **VM lớp 1**: loader core được compile lại ngẫu nhiên mỗi request |
 | `api/challenge.js` | Phát challenge proof-of-work (chống bot/scraper) |
 | `api/session.js` | Xác thực PoW + fingerprint, cấp token 180s + key riêng cho phiên |
@@ -71,9 +71,10 @@ Rồi `npm run build` và deploy lại. `id` chỉ dùng `[a-z0-9_-]`; link raw 
 
 ```
 executor
-  └─ GET /api/r/<id>                → stub VM 2 lớp + string-encode (ngẫu nhiên mỗi lần)
-     └─ VM giải stub                → loadstring(game:HttpGet(".../api/stage/<id>?s=<ticket>"))()
-        └─ GET /api/stage/<id>?s=.. → runtime VM + chương trình lớp 1 (ngẫu nhiên mỗi lần)
+  └─ GET /api/r/<id>                → stub: VM đã đổi tên + chuỗi 2–4 chương trình lồng nhau (ngẫu nhiên mỗi lần)
+     └─ VM giải từng lớp (key lớp sau = mac(salt, key lớp trước), tính trong VM)
+        └─ op EXEC chạy snippet bằng loadstring native **bên trong VM** — không trả source ra ngoài
+           └─ GET /api/stage/<id>?s=.. → runtime VM + chương trình lớp 1 (ngẫu nhiên mỗi lần)
            └─ VM giải mã core       → handshake
               ├─ GET /api/challenge → c=<hmac>&d=<bits>
               ├─ giải PoW bằng SHA-256 (Lua)
@@ -92,7 +93,9 @@ Mỗi lần load, chương trình VM đổi chunk, đổi số thanh ghi, đổi
 | --- | --- | --- |
 | Raw link màn đen | Người mở link bằng trình duyệt đọc/copy bootstrap | Trình duyệt nhận HTML đen, không phát ticket stage |
 | Bot/scraper UA bị chặn | `curl`, `wget`, `python`, `node`, `axios`, `okhttp`, headless… | `403` + trang đen, không sinh code |
-| Stub raw được obfuscate | Copy stub rồi grep `HttpGet`, URL stage, host | 2 lớp VM lồng nhau + string-encode, key/layout mới mỗi request |
+| Stub raw được obfuscate | Copy stub rồi grep `HttpGet`, URL stage, host | VM đổi tên biến + string-encode + 2–4 lớp lồng nhau, key/layout mới mỗi request |
+| Không có ranh giới plaintext | Vá stub kiểu `print(sS)` / `sF(vm_run)` để moi lớp trong | Việc chạy code nằm trong VM (op `EXEC`); stub chỉ còn `return <entry>(p,k)` |
+| Key theo tầng | Dump một lớp rồi giải tay | Key lớp sau = `mac(salt, key lớp trước)`, chỉ tính được khi chạy đúng VM |
 | Ticket stage 120s | Hotlink/chia sẻ URL stage đã bắt | Lấy link mới mỗi lần load |
 | VM 2 lớp + key theo phiên | Dump tĩnh, chia sẻ file đã bắt | Payload luôn được compile lại theo phiên |
 | String encryption + strip comment | `grep`/đọc trộm payload | Mọi string literal thành bảng XOR |
@@ -111,7 +114,7 @@ Mỗi lần load, chương trình VM đổi chunk, đổi số thanh ghi, đổi
 
 - Ai đó chạy loader trong môi trường của họ và hook đúng `loadstring` **trước khi** guard chạy vẫn có thể lấy được source tại thời điểm thực thi. Guard phát hiện wrapper phổ biến và dừng lại, nhưng một RE kiên nhẫn với custom build của executor thì không có cách chặn tuyệt đối.
 - VM làm tăng chi phí đọc/dump, không phải mã hoá bất khả xâm phạm. Key phiên nằm trong RAM client.
-- Stub raw link cũng vậy: nó chặn tool tự động (1 lần dump chỉ ra thêm một chương trình VM khác), nhưng người ngồi giải tay từng lớp vẫn lấy được URL stage — chỉ có điều URL đó chết sau 120s.
+- Stub raw link: bản bắt được chỉ gồm chương trình đã mã hoá + VM đã đổi tên, không có dòng `vm_run(...)` nào để vá thành `print`. Mỗi lớp dump ra còn thiếu key (key lớp sau suy ra từ key lớp trước bên trong VM), nên muốn đi tiếp phải viết lại đúng VM. Người kiên nhẫn vẫn làm được, nhưng URL stage lấy ra chỉ sống 120s.
 - Không HWID/license nghĩa là không thể ban theo người dùng; chống lạm dụng dựa vào PoW + fingerprint + rotate `HUB_SECRET`.
 - Không có rate limit theo IP (Vercel không có store). Nếu bị flood thật, tăng `HUB_POW_BITS` hoặc gắn thêm Vercel Firewall/Upstash.
 - Obfuscator không đổi tên biến (để không phá script). Muốn mạnh hơn thì thêm bước rename theo scope, đây là hướng mở rộng.
@@ -133,6 +136,8 @@ program size    365 KB
 
 Script hub thường 20–80 KB nên decode thực tế khoảng 100–300 ms.
 
+Raw stub (`/api/r/<id>`): 18–21 KB tuỳ số lớp (2–4 lớp ngẫu nhiên), render phía Vercel ~19 ms, client giải + chạy xong trong ~20 ms (đo bằng Lua 5.4 trong WASM, Luau nhanh hơn).
+
 ## Cấu trúc
 
 ```
@@ -151,5 +156,5 @@ test/           harness Roblox giả lập + fixture
 ```bash
 npm run build   # obfuscate payload + core → data/generated.mjs
 npm run dev     # build + dev server (route giống Vercel)
-npm test        # build + 17 check end-to-end
+npm test        # build + 18 check end-to-end
 ```

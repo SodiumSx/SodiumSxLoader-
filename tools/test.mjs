@@ -319,13 +319,25 @@ await check("hooked string.char is detected (env-log style)", async () => {
 local realChar = string.char
 string.char = function(...) return realChar(...) end
 `;
-  const { lua, prints } = await newEngine({ prelude });
+  const { lua, prints, requests } = await newEngine({ prelude });
   await runStage(lua, "example");
   assert.ok(!prints.some((line) => line.includes("payload running")), "payload must not run");
-  assert.ok(
-    prints.some((line) => line.includes("loader stopped (env")),
-    `expected env stop, prints=${JSON.stringify(prints)}`,
-  );
+  assert.equal(requests.length, 0, "a hooked environment must never reach the network");
+});
+
+await check("stub exposes no internal names and no decode-then-load step", async () => {
+  const first = await fetchStub("example");
+  const second = await fetchStub("example");
+  for (const body of [first, second]) {
+    for (const name of ["vm_run", "vm_boot", "vm_mac", "vm_ks", "vm_unseal", "maxSteps"]) {
+      assert.ok(!body.includes(name), `stub must not contain ${name}`);
+    }
+    assert.ok(!body.includes("local sS"), "stub must not hand the decoded program to a local");
+    assert.match(body, /^local \w+,\w+=\[\[/, "stub starts at the program, no decode step");
+  }
+  const entry = (body) => (body.match(/return (\w+)\(p,k\)\s*$/) || [])[1];
+  assert.ok(entry(first), "stub must call a VM entry point");
+  assert.notEqual(entry(first), entry(second), "entry point is renamed on every response");
 });
 
 await check("obfuscation preserves Lua semantics", async () => {
