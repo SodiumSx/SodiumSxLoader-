@@ -260,6 +260,14 @@ await check("stage responses are randomized per request", async () => {
   assert.ok(a.includes("vm_run"), "stage should ship the VM runtime");
 });
 
+await check("a stage ticket can be spent only once", async () => {
+  const url = await stageUrl("example");
+  assert.equal((await fetch(url)).status, 200, "first spend");
+  assert.equal((await fetch(url)).status, 403, "replayed stage url");
+  const next = await stageUrl("example");
+  assert.equal((await fetch(next)).status, 200, "a new load gets a new ticket");
+});
+
 await check("payload endpoint rejects missing or forged tokens", async () => {
   assert.equal((await fetch(`${BASE}/api/payload/example`)).status, 401);
   assert.equal((await fetch(`${BASE}/api/payload/example?t=abc.def`)).status, 401);
