@@ -1,18 +1,24 @@
 import { findScript } from "../../lib/data.mjs";
 import { isBrowserRequest, param, publicBaseUrl, sendBlackout, sendText } from "../../lib/http.mjs";
+import { scraperLike } from "../../lib/policy.mjs";
 import { masterSecret } from "../../lib/secret.mjs";
+import { renderRawStub } from "../../lib/stub.mjs";
 import { issueStageToken } from "../../lib/token.mjs";
 
 /**
- * The raw link. It must never show hub source: only the one-line bootstrap.
- *   loadstring(game:HttpGet("https://host/api/stage/<id>?s=<ticket>"))()
- * The ticket keeps a stolen stage URL usable for two minutes only.
+ * The raw link. It must never show hub source, and it must not hand a readable
+ * `loadstring(game:HttpGet(...))` line to anyone: executors get a VM-packed stub
+ * that decodes the stage URL at runtime, everything else gets a black page.
  *
- * A browser page visit gets a black screen instead: the bootstrap line is for
- * executors (Roblox/WinInet), not for people reading the link in a tab.
+ * Rejected before any token is minted:
+ *   - browsers (a person opening the link in a tab)
+ *   - scraper UAs (curl, wget, python, node, axios, okhttp, headless…)
+ *
+ * The ticket inside the stub keeps a stolen stage URL usable for two minutes.
  */
 export default function handler(req, res) {
   if (isBrowserRequest(req)) return sendBlackout(res);
+  if (scraperLike(req.headers["user-agent"])) return sendBlackout(res, { status: 403 });
 
   const id = param(req);
   const script = findScript(id);
@@ -27,9 +33,15 @@ export default function handler(req, res) {
     return sendText(res, `warn("[FreeHub] ${error.message}")\n`, { status: 500 });
   }
 
-  const base = publicBaseUrl(req);
-  const line = `loadstring(game:HttpGet("${base}/api/stage/${script.id}?s=${ticket}"))()\n`;
-  return sendText(res, line, {
+  let stub;
+  try {
+    stub = renderRawStub({ host: publicBaseUrl(req), scriptId: script.id, ticket });
+  } catch (error) {
+    return sendText(res, `warn("[FreeHub] ${error.message}")\n`, { status: 500 });
+  }
+
+  return sendText(res, stub, {
+    type: "text/plain; charset=utf-8",
     cache: "no-store",
     extra: { "X-Robots-Tag": "noindex, nofollow", Vary: "User-Agent, Accept" },
   });

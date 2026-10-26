@@ -5,14 +5,15 @@ Client chỉ nhận chương trình VM đã mã hoá, không bao giờ nhận so
 
 ```
 Người dùng dán:  loadstring(game:HttpGet("https://hub.vercel.app/api/r/example"))()
-Trình duyệt thấy: đúng 1 dòng đó, không có source
+Trình duyệt thấy: màn hình đen, không có loadstring lẫn source
 ```
 
 ## Có gì trong này
 
 | Thành phần | Mô tả |
 | --- | --- |
-| `api/r/[id].js` | Raw link — trả về đúng một dòng `loadstring(...)()` |
+| `api/r/[id].js` | Raw link — trình duyệt/bot thấy màn đen, executor nhận stub đã obfuscate (không còn dòng `loadstring(game:HttpGet(...))` đọc được) |
+| `lua/stub.tpl`, `lib/stub.mjs` | Stub raw link: VM-pack + mã hoá string, sinh lại ngẫu nhiên mỗi request |
 | `api/stage/[id].js` | **VM lớp 1**: loader core được compile lại ngẫu nhiên mỗi request |
 | `api/challenge.js` | Phát challenge proof-of-work (chống bot/scraper) |
 | `api/session.js` | Xác thực PoW + fingerprint, cấp token 180s + key riêng cho phiên |
@@ -31,10 +32,10 @@ Không có database, không có KV: token, key và PoW đều suy ra từ `HUB_S
 ```bash
 npm install
 npm run dev        # build + http://127.0.0.1:3000
-npm test           # 15 check end-to-end bằng Lua thật (wasmoon)
+npm test           # 17 check end-to-end bằng Lua thật (wasmoon)
 ```
 
-`npm run dev` in ra link raw mẫu. Mở link đó trên trình duyệt sẽ chỉ thấy một dòng `loadstring`.
+`npm run dev` in ra link raw mẫu. Mở link đó trên trình duyệt sẽ chỉ thấy màn hình đen, và `curl`/`wget`/`python`/UA bot nhận `403` — chỉ client kiểu executor (`Roblox/WinInet`) nhận stub, mà stub thì đã bị VM-pack nên không đọc được URL stage bên trong.
 
 ## Deploy Vercel
 
@@ -70,16 +71,17 @@ Rồi `npm run build` và deploy lại. `id` chỉ dùng `[a-z0-9_-]`; link raw 
 
 ```
 executor
-  └─ GET /api/r/<id>                 → loadstring(game:HttpGet(".../api/stage/<id>?s=<ticket>"))()
-     └─ GET /api/stage/<id>?s=...    → runtime VM + chương trình lớp 1 (ngẫu nhiên mỗi lần)
-        └─ VM giải mã core            → handshake
-           ├─ GET /api/challenge      → c=<hmac>&d=<bits>
-           ├─ giải PoW bằng SHA-256 (Lua)
-           ├─ GET /api/session        → t=<token>&k=<key 32 hex>&x=<exp>
-           ├─ GET /api/payload/<id>?t=→ m=<MAC>&z=<len>\n\n<chương trình lớp 2>
-           ├─ VM lớp 2 giải mã payload bằng key phiên
-           ├─ verify MAC + độ dài
-           └─ audit môi trường → loadstring + sandbox env → chạy
+  └─ GET /api/r/<id>                → stub VM 2 lớp + string-encode (ngẫu nhiên mỗi lần)
+     └─ VM giải stub                → loadstring(game:HttpGet(".../api/stage/<id>?s=<ticket>"))()
+        └─ GET /api/stage/<id>?s=.. → runtime VM + chương trình lớp 1 (ngẫu nhiên mỗi lần)
+           └─ VM giải mã core       → handshake
+              ├─ GET /api/challenge → c=<hmac>&d=<bits>
+              ├─ giải PoW bằng SHA-256 (Lua)
+              ├─ GET /api/session   → t=<token>&k=<key 32 hex>&x=<exp>
+              ├─ GET /api/payload/<id>?t= → m=<MAC>&z=<len>\n\n<chương trình lớp 2>
+              ├─ VM lớp 2 giải mã payload bằng key phiên
+              ├─ verify MAC + độ dài
+              └─ audit môi trường → loadstring + sandbox env → chạy
 ```
 
 Mỗi lần load, chương trình VM đổi chunk, đổi số thanh ghi, đổi thứ tự lệnh, đổi key. Chương trình bắt được ở lần trước không dùng lại được cho lần sau.
@@ -88,7 +90,9 @@ Mỗi lần load, chương trình VM đổi chunk, đổi số thanh ghi, đổi
 
 | Cơ chế | Chống gì | Ghi chú |
 | --- | --- | --- |
-| Raw link 1 dòng | Người xem link tưởng có source | Raw chỉ là bootstrap |
+| Raw link màn đen | Người mở link bằng trình duyệt đọc/copy bootstrap | Trình duyệt nhận HTML đen, không phát ticket stage |
+| Bot/scraper UA bị chặn | `curl`, `wget`, `python`, `node`, `axios`, `okhttp`, headless… | `403` + trang đen, không sinh code |
+| Stub raw được obfuscate | Copy stub rồi grep `HttpGet`, URL stage, host | 2 lớp VM lồng nhau + string-encode, key/layout mới mỗi request |
 | Ticket stage 120s | Hotlink/chia sẻ URL stage đã bắt | Lấy link mới mỗi lần load |
 | VM 2 lớp + key theo phiên | Dump tĩnh, chia sẻ file đã bắt | Payload luôn được compile lại theo phiên |
 | String encryption + strip comment | `grep`/đọc trộm payload | Mọi string literal thành bảng XOR |
@@ -97,7 +101,7 @@ Mỗi lần load, chương trình VM đổi chunk, đổi số thanh ghi, đổi
 | Anti-env-log | `getgenv` có proxy `__index/__newindex`, spy toàn cục, debug hook | Fail-closed |
 | `checkcaller` + wrapper predicates | Hook gọi loader từ C boundary, wrapper Synapse/Fluxus | Nếu executor hỗ trợ |
 | Anti-tamper | Sửa payload trên đường truyền | MAC khoá theo phiên + check length |
-| Anti-bot / anti-curl | Scraper tự động, `curl`/`wget`/`python` | PoW + fingerprint executor + blocklist |
+| Anti-bot / anti-curl | Scraper tự động, `curl`/`wget`/`python` | UA blocklist ở raw link + PoW + fingerprint executor |
 | Token 180s | Dùng lại link payload | HMAC, gắn script id + nonce + place |
 | Sandbox env | Script ghi bẩn `getgenv`, spy đọc global | Global của script nằm trong bảng riêng |
 
@@ -107,6 +111,7 @@ Mỗi lần load, chương trình VM đổi chunk, đổi số thanh ghi, đổi
 
 - Ai đó chạy loader trong môi trường của họ và hook đúng `loadstring` **trước khi** guard chạy vẫn có thể lấy được source tại thời điểm thực thi. Guard phát hiện wrapper phổ biến và dừng lại, nhưng một RE kiên nhẫn với custom build của executor thì không có cách chặn tuyệt đối.
 - VM làm tăng chi phí đọc/dump, không phải mã hoá bất khả xâm phạm. Key phiên nằm trong RAM client.
+- Stub raw link cũng vậy: nó chặn tool tự động (1 lần dump chỉ ra thêm một chương trình VM khác), nhưng người ngồi giải tay từng lớp vẫn lấy được URL stage — chỉ có điều URL đó chết sau 120s.
 - Không HWID/license nghĩa là không thể ban theo người dùng; chống lạm dụng dựa vào PoW + fingerprint + rotate `HUB_SECRET`.
 - Không có rate limit theo IP (Vercel không có store). Nếu bị flood thật, tăng `HUB_POW_BITS` hoặc gắn thêm Vercel Firewall/Upstash.
 - Obfuscator không đổi tên biến (để không phá script). Muốn mạnh hơn thì thêm bước rename theo scope, đây là hướng mở rộng.
@@ -146,5 +151,5 @@ test/           harness Roblox giả lập + fixture
 ```bash
 npm run build   # obfuscate payload + core → data/generated.mjs
 npm run dev     # build + dev server (route giống Vercel)
-npm test        # build + 15 check end-to-end
+npm test        # build + 17 check end-to-end
 ```

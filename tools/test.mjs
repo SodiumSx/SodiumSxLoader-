@@ -96,18 +96,37 @@ async function newEngine({ prelude = "", tamper = false } = {}) {
   return { lua, prints, requests };
 }
 
-async function stageUrl(scriptId) {
-  const stub = await (await fetch(`${BASE}/api/r/${scriptId}`)).text();
-  const match = /HttpGet\("([^"]+)"\)/.exec(stub);
-  assert.ok(match, `stub has no url: ${stub}`);
-  return match[1];
+// Executors inherit Roblox's HTTP client agent; everything else is refused.
+const EXECUTOR = { "user-agent": "Roblox/WinInet" };
+
+async function fetchStub(scriptId) {
+  const response = await fetch(`${BASE}/api/r/${scriptId}`, { headers: EXECUTOR });
+  assert.equal(response.status, 200, `raw ${scriptId}`);
+  return response.text();
 }
 
+/** Run the stub in the mock executor and return the stage URL it requests. */
+async function stubStageUrl(stub) {
+  const lua = await new LuaFactory().createEngine();
+  await lua.doString(BIT32_SHIM);
+  await lua.doString(harness);
+  const seen = [];
+  lua.global.set("__httpget", (url) => {
+    seen.push(String(url));
+    return "do return end";
+  });
+  await lua.doString(stub);
+  assert.equal(seen.length, 1, `stub requested ${seen.length} urls`);
+  return seen[0];
+}
+
+async function stageUrl(scriptId) {
+  return stubStageUrl(await fetchStub(scriptId));
+}
+
+// Runs the whole chain the way an executor does: raw stub -> stage -> payload.
 async function runStage(lua, scriptId) {
-  const stage = await (await fetch(await stageUrl(scriptId))).text();
-  lua.global.set("STAGE", stage);
-  await lua.doString("local f, err = load(STAGE, '=stage'); if not f then error(err) end; f()");
-  return stage;
+  await lua.doString(await fetchStub(scriptId));
 }
 
 const results = [];
@@ -126,18 +145,24 @@ function check(name, fn) {
 
 console.log(`hub: ${BASE}  pow=${POW_BITS} bits`);
 
-await check("raw link is a single loadstring line and leaks nothing", async () => {
-  const response = await fetch(`${BASE}/api/r/example`);
-  assert.equal(response.status, 200);
-  assert.match(response.headers.get("content-type"), /text\/plain/);
-  const body = await response.text();
-  assert.equal(body.trim().split("\n").length, 1);
-  assert.match(
-    body.trim(),
-    /^loadstring\(game:HttpGet\("http:\/\/127\.0\.0\.1:\d+\/api\/stage\/example\?s=[\w.-]+"\)\)\(\)$/,
-  );
-  assert.ok(!body.includes("GetService"), "raw must not contain payload");
-  assert.ok(!body.includes("HttpService"), "raw must not contain payload");
+await check("raw link ships an obfuscated stub, never readable Lua", async () => {
+  const first = await fetchStub("example");
+  const second = await fetchStub("example");
+  assert.notEqual(first, second, "two visits must not share bytes");
+
+  for (const body of [first, second]) {
+    assert.ok(!body.includes("HttpGet"), "raw must not name HttpGet");
+    assert.ok(!body.includes("/api/stage/"), "raw must not contain the stage path");
+    assert.ok(!body.includes("127.0.0.1"), "raw must not contain the host");
+    assert.ok(!body.includes("GetService"), "raw must not contain payload");
+    assert.ok(!body.includes("HttpService"), "raw must not contain payload");
+    assert.ok(body.length > 2000, "raw should carry the full VM runtime");
+  }
+
+  const url = await stubStageUrl(first);
+  assert.match(url, /^http:\/\/127\.0\.0\.1:\d+\/api\/stage\/example\?s=[\w.-]+$/);
+  const other = await stubStageUrl(second);
+  assert.notEqual(url, other, "every stub should carry its own ticket");
 });
 
 await check("browser visits to the raw link only get a black screen", async () => {
@@ -161,12 +186,38 @@ await check("browser visits to the raw link only get a black screen", async () =
     assert.match(body, /background:\s*#000/, "page must be black");
   }
 
-  const bot = await fetch(`${BASE}/api/r/example`, { headers: { "user-agent": "Roblox/WinInet" } });
-  assert.match(await bot.text(), /^loadstring\(game:HttpGet\(/, "executors still get the bootstrap");
+  const executor = await fetch(`${BASE}/api/r/example`, { headers: EXECUTOR });
+  assert.equal(executor.status, 200, "executors are not blacked out");
+  assert.match(executor.headers.get("content-type"), /text\/plain/);
+});
+
+await check("scraper user agents never reach the stub code", async () => {
+  const agents = [
+    "curl/8.4.0",
+    "Wget/1.21.4",
+    "python-requests/2.31.0",
+    "python-urllib3/2.2.1",
+    "node",
+    "axios/1.7.2",
+    "Go-http-client/1.1",
+    "PostmanRuntime/7.39.0",
+    "libwww-perl/6.7",
+    "okhttp/4.12.0",
+    "Scrapy/2.11 (+https://scrapy.org)",
+  ];
+  for (const ua of agents) {
+    const response = await fetch(`${BASE}/api/r/example`, { headers: { "user-agent": ua } });
+    const body = await response.text();
+    assert.equal(response.status, 403, ua);
+    assert.ok(!body.includes("vm_run"), `${ua} must not get the stub`);
+    assert.ok(!body.includes("/api/stage/"), `${ua} must not get a stage url`);
+  }
 });
 
 await check("unknown script ids 404", async () => {
-  for (const path of ["r", "stage", "payload"]) {
+  const raw = await fetch(`${BASE}/api/r/does-not-exist`, { headers: EXECUTOR });
+  assert.equal(raw.status, 404, "r");
+  for (const path of ["stage", "payload"]) {
     const response = await fetch(`${BASE}/api/${path}/does-not-exist`);
     assert.equal(response.status, 404, path);
   }
