@@ -240,7 +240,7 @@ await check("stage requires a fresh ticket", async () => {
 
 await check("stage ticket dies in seconds, not minutes", async () => {
   const ttl = stageTtlMs();
-  assert.ok(ttl <= 30_000, `stage ticket should live <= 30s, got ${ttl}ms`);
+  assert.ok(ttl <= 5_000, `stage ticket should live ~2s, got ${ttl}ms`);
   const master = masterSecret();
   const now = Date.now();
   const stale = signToken(master, { kind: "stage", sid: "example", iat: now - 60_000, exp: now - 1_000 });

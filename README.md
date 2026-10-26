@@ -45,7 +45,7 @@ npm test           # 20 check end-to-end bằng Lua thật (wasmoon)
 3. Environment Variables:
    - `HUB_SECRET` = chuỗi ngẫu nhiên ≥ 32 ký tự (`openssl rand -hex 32`)
    - `HUB_POW_BITS` = `10` (tuỳ chọn)
-   - `HUB_STAGE_TTL` = `20` (tuỳ chọn, giây — thời gian sống của ticket stage, 10–120)
+   - `HUB_STAGE_TTL` = `2` (tuỳ chọn, giây — thời gian sống của ticket stage, 2–120; mạng chậm hay cold start thì nâng lên 5–8)
    - `HUB_PUBLIC_URL` / `HUB_ALLOWED_HOSTS` (tuỳ chọn)
    - `UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN` (tuỳ chọn — bật ticket dùng một lần)
 4. Deploy. Mọi thứ còn lại tự sinh theo host của request, nên preview và production đều chạy.
@@ -54,7 +54,7 @@ Không đặt `HUB_SECRET` thì API trả 500 (fail-closed) chứ không chạy 
 
 ### Ticket dùng một lần (tuỳ chọn, nên bật)
 
-Mỗi ticket stage mang một nonce ngẫu nhiên, và `/api/stage` tiêu thụ nó bằng `SET <key> 1 NX EX <ttl>` — Redis xử lý NX nguyên tử, nên đúng **một** request được dùng vé. URL stage bị bắt giữa đường rồi đem đi dùng lại (executor khác, bạn bè, cache) nhận `403 link already used`, kể cả khi còn trong 20 giây.
+Mỗi ticket stage mang một nonce ngẫu nhiên, và `/api/stage` tiêu thụ nó bằng `SET <key> 1 NX EX <ttl>` — Redis xử lý NX nguyên tử, nên đúng **một** request được dùng vé. URL stage bị bắt giữa đường rồi đem đi dùng lại (executor khác, bạn bè, cache) nhận `403 link already used`, kể cả khi còn trong 2 giây.
 
 Cách bật trên Vercel (Vercel KV đã sunset, thay bằng Upstash qua Marketplace):
 
@@ -62,7 +62,7 @@ Cách bật trên Vercel (Vercel KV đã sunset, thay bằng Upstash qua Marketp
 2. Vercel tự thêm 2 biến `KV_REST_API_URL` / `KV_REST_API_TOKEN` (Upstash dùng tên `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN`; `lib/kv.mjs` đọc cả hai).
 3. Redeploy.
 
-Không có store: dev/test chạy memory trong cùng process (đúng, vì dev server một process), còn production lùi về chỉ dựa TTL 20s và in một dòng cảnh báo. Store lỗi/timeout cũng lùi về TTL — Redis chết không làm loader chết, chỉ mất tính dùng-một-lần.
+Không có store: dev/test chạy memory trong cùng process (đúng, vì dev server một process), còn production lùi về chỉ dựa TTL 2s và in một dòng cảnh báo. Store lỗi/timeout cũng lùi về TTL — Redis chết không làm loader chết, chỉ mất tính dùng-một-lần.
 
 Đánh đổi: hai request tranh cùng vé thì request thứ hai `403`; người dùng thật chỉ cần load lại link raw (ra vé mới).
 
@@ -114,7 +114,7 @@ Mỗi lần load, chương trình VM đổi chunk, đổi số thanh ghi, đổi
 | Không có ranh giới plaintext | Vá stub kiểu `print(sS)` / `sF(vm_run)` để moi lớp trong | Việc chạy code nằm trong VM (op `EXEC`); stub chỉ còn `return <entry>(p,k)` |
 | Key theo tầng | Dump một lớp rồi giải tay | Key lớp sau = `mac(salt, key lớp trước)`, chỉ tính được khi chạy đúng VM |
 | Ticket stage dùng một lần | Dùng lại URL stage bắt được, chia sẻ link, cache | `SET NX` nguyên tử trên Upstash (tuỳ chọn); không có store thì chỉ còn TTL |
-| Ticket stage 20s | Hotlink/chia sẻ URL stage đã bắt | Lấy link mới mỗi lần load; đổi bằng `HUB_STAGE_TTL` (10–120s) |
+| Ticket stage 2s | Hotlink/chia sẻ URL stage đã bắt | Lấy link mới mỗi lần load; đổi bằng `HUB_STAGE_TTL` (2–120s) |
 | VM 2 lớp + key theo phiên | Dump tĩnh, chia sẻ file đã bắt | Payload luôn được compile lại theo phiên |
 | String encryption + strip comment | `grep`/đọc trộm payload | Mọi string literal thành bảng XOR |
 | Anti-hook native | `loadstring`, `string.char`, `table.concat`… bị bọc bằng Lua closure | Native thật luôn là `[C]` |
@@ -132,8 +132,8 @@ Mỗi lần load, chương trình VM đổi chunk, đổi số thanh ghi, đổi
 
 - Ai đó chạy loader trong môi trường của họ và hook đúng `loadstring` **trước khi** guard chạy vẫn có thể lấy được source tại thời điểm thực thi. Guard phát hiện wrapper phổ biến và dừng lại, nhưng một RE kiên nhẫn với custom build của executor thì không có cách chặn tuyệt đối.
 - VM làm tăng chi phí đọc/dump, không phải mã hoá bất khả xâm phạm. Key phiên nằm trong RAM client.
-- Stub raw link: bản bắt được chỉ gồm chương trình đã mã hoá + VM đã đổi tên, không có dòng `vm_run(...)` nào để vá thành `print`. Mỗi lớp dump ra còn thiếu key (key lớp sau suy ra từ key lớp trước bên trong VM), nên muốn đi tiếp phải viết lại đúng VM. Người kiên nhẫn vẫn làm được, nhưng URL stage lấy ra chỉ sống 20 giây (`HUB_STAGE_TTL`), và vé đó không gắn với ai nên chia sẻ lại gần như vô dụng.
-- Vé dùng một lần chỉ mạnh khi đã bật store: xem mục *Ticket dùng một lần*. Không có store thì URL stage bắt được vẫn dùng lại được trong 20 giây.
+- Stub raw link: bản bắt được chỉ gồm chương trình đã mã hoá + VM đã đổi tên, không có dòng `vm_run(...)` nào để vá thành `print`. Mỗi lớp dump ra còn thiếu key (key lớp sau suy ra từ key lớp trước bên trong VM), nên muốn đi tiếp phải viết lại đúng VM. Người kiên nhẫn vẫn làm được, nhưng URL stage lấy ra chỉ sống 2 giây (`HUB_STAGE_TTL`), và vé đó không gắn với ai nên chia sẻ lại gần như vô dụng.
+- Vé dùng một lần chỉ mạnh khi đã bật store: xem mục *Ticket dùng một lần*. Không có store thì URL stage bắt được vẫn dùng lại được trong 2 giây.
 - Ai đọc được stub trên đường truyền vẫn có thể **tranh** tiêu vé trước người dùng thật (họ nhận `403`, load lại là xong); đó là phá hoại, không phải lấy được code.
 - Không HWID/license nghĩa là không thể ban theo người dùng; chống lạm dụng dựa vào PoW + fingerprint + rotate `HUB_SECRET`.
 - Không có rate limit theo IP (Vercel không có store). Nếu bị flood thật, tăng `HUB_POW_BITS`, gắn Vercel Firewall, hoặc dùng chính Upstash bạn đã bật cho vé dùng một lần.

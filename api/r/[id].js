@@ -14,7 +14,7 @@ import { issueStageToken } from "../../lib/token.mjs";
  *   - browsers (a person opening the link in a tab)
  *   - scraper UAs (curl, wget, python, node, axios, okhttp, headless…)
  *
- * The ticket inside the stub keeps a stolen stage URL usable for ~20 seconds.
+ * The ticket inside the stub keeps a stolen stage URL usable for ~2 seconds.
  */
 export default function handler(req, res) {
   if (isBrowserRequest(req)) return sendBlackout(res);

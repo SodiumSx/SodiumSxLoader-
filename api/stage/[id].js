@@ -8,7 +8,7 @@ import { openToken } from "../../lib/token.mjs";
 /**
  * Layer 1: the loader core, VM-compiled and re-randomized on every request.
  * Requires the short-lived ticket from the raw link, so hotlinking a stage URL
- * from another hub or a scraper cache fails after ~20 seconds.
+ * from another hub or a scraper cache fails after ~2 seconds.
  *
  * A ticket is also single-use: its nonce is claimed with an atomic SET NX, so a
  * stage URL captured in transit is dead as soon as it has been served once. If
