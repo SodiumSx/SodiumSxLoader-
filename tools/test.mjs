@@ -380,6 +380,16 @@ await check("obfuscation preserves Lua semantics", async () => {
   assert.ok(!code.includes("line comment"), "comments removed");
   assert.ok(!code.includes('double \\" quote'), "strings encoded");
 
+  // Luau (Roblox and every executor) rejects a call whose '(' starts on a later
+  // line than the callee, and Luau compound assignments must stay one token.
+  const luau = "local x=1\nx+=2\nx..='a'\nlocal f=print\nf 'hi'\n";
+  for (let i = 0; i < 8; i++) {
+    const sample = obfuscateLua(luau).code;
+    assert.ok(sample.includes("+="), "compound assignment stays one token");
+    assert.ok(sample.includes("..="), "concat-assign stays one token");
+    assert.ok(!/\n[ \t]*\(/.test(sample), "no newline before '(' (Luau call ambiguity)");
+  }
+
   const words = sessionKeyWords("obf-secret", "tricky", "a".repeat(32));
   const keyHex = keyWordsToHex(words);
   const { program } = compileVm(code, { keyWords: words, rng: makeRng(99) });
