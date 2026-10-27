@@ -1,0 +1,15 @@
+import { LuaFactory } from "wasmoon";
+import { readFileSync } from "node:fs";
+import { obfuscateLua } from "../lib/lua-obfuscate.mjs";
+const source = 'local n = 0 for i = 1, 4 do n = n + #("xor-check") end print(n)';
+const { code } = obfuscateLua(source, { rng: () => 0.1 });
+console.log("contains fallback:", code.includes("bit32 and bit32.bxor"));
+console.log(code.slice(0, 900));
+const lua = await new LuaFactory().createEngine();
+await lua.doString(readFileSync("test/harness.lua", "utf8"));
+const prints = [];
+lua.global.set("__print", (l) => prints.push(String(l)));
+lua.global.set("SRC", code);
+console.log("running...");
+await lua.doString("local f, err = load(SRC, '=nobit32'); if not f then error(err) end; f()");
+console.log("prints:", prints);
