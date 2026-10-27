@@ -19,6 +19,7 @@ const config = JSON.parse(readFileSync(join(root, "hub.config.json"), "utf8"));
 const ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 
 const scripts = [];
+const built = [];
 const seen = new Set();
 
 for (const entry of config.scripts) {
@@ -43,6 +44,7 @@ for (const entry of config.scripts) {
     code,
     size: { source: stats.bytesIn, packed: stats.bytesOut, strings: stats.strings },
   });
+  built.push({ id: entry.id, stats });
 }
 
 const coreParts = ["lua/vm.lua", "lua/sha.lua", "lua/guard.lua", "lua/core.lua"].map((file) =>
@@ -75,8 +77,11 @@ const total = scripts.reduce(
 );
 console.log(`core      ${core.length.toLocaleString()} bytes  build ${build.version}`);
 for (const script of scripts) {
+  const stats = built.find((b) => b.id === script.id).stats;
+  const rename = stats.renameSkipped ? `rename skipped (${stats.renameSkipped})` : `${stats.renamed} locals renamed`;
   console.log(
-    `script    ${script.id.padEnd(16)} ${String(script.size.source).padStart(7)} -> ${String(script.size.packed).padStart(7)} bytes  (${script.size.strings} strings encoded)`,
+    `script    ${script.id.padEnd(16)} ${String(script.size.source).padStart(7)} -> ${String(script.size.packed).padStart(7)} bytes  ` +
+      `(${script.size.strings} strings, ${stats.inlined} inlined, ${stats.hoisted} hoisted, ${rename}, ${stats.profile})`,
   );
 }
 console.log(`payloads  ${total.src.toLocaleString()} -> ${total.packed.toLocaleString()} bytes`);

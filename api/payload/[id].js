@@ -3,6 +3,7 @@ import { fail, param, queryOf, sendText } from "../../lib/http.mjs";
 import { masterSecret } from "../../lib/secret.mjs";
 import { mac, sessionKeyWords } from "../../lib/crypto.mjs";
 import { botLike } from "../../lib/policy.mjs";
+import { chunkSizesFor } from "../../lib/obf-profile.mjs";
 import { openToken } from "../../lib/token.mjs";
 import { compileVm } from "../../lib/vm.mjs";
 
@@ -33,7 +34,10 @@ export default function handler(req, res) {
   if (botLike(claims.e)) return fail(res, 403, "unsupported client");
 
   const words = sessionKeyWords(secret, id, claims.n);
-  const { program } = compileVm(script.code, { keyWords: words });
+  // Chunk size comes from the payload size: many small chunks buy layout
+  // entropy that a 4 KB script can afford, but on a 300 KB script the per-chunk
+  // decode overhead dominates startup.
+  const { program } = compileVm(script.code, { keyWords: words, ...chunkSizesFor(script.code.length) });
   const tag = mac(Buffer.from(script.code, "utf8"), words);
   const length = Buffer.byteLength(script.code, "utf8");
 

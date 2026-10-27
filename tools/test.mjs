@@ -259,7 +259,14 @@ await check("stage responses are randomized per request", async () => {
   assert.notEqual(a, b, "two loads must not share bytes");
   assert.ok(!a.includes("core_host"), "core source must not be in the clear");
   assert.ok(!a.includes("HttpService"), "payload must not be in the stage");
-  assert.ok(a.includes("vm_run"), "stage should ship the VM runtime");
+  for (const name of ["vm_run", "vm_boot", "vm_unseal", "vm_key", "vm_mac", "vm_step"]) {
+    assert.ok(!a.includes(name), `stage must not name ${name}`);
+  }
+  assert.ok(!a.includes("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"), "base64 alphabet must be encrypted");
+  assert.ok(!a.includes("0123456789abcdef"), "hex alphabet must be encrypted");
+  assert.match(a, /\[\[\d+,\d+/, "stage should ship the compiled program");
+  assert.match(a, /"[0-9a-f]{32}"/, "stage should ship a session key");
+  assert.ok(a.includes("loadstring or load"), "stage should still bootstrap a loader");
 });
 
 await check("a stage ticket can be spent only once", async () => {
@@ -399,6 +406,110 @@ await check("obfuscation preserves Lua semantics", async () => {
 
   const decoded = await runObfuscated(program, keyHex);
   assert.equal(decoded, expected);
+});
+
+await check("renaming locals preserves behaviour on every scope construct", async () => {
+  const original = readFileSync("test/fixtures/scope.lua", "utf8");
+  const { code, stats } = obfuscateLua(original);
+  assert.equal(stats.renameSkipped, null, `renamer bailed out: ${stats.renameSkipped}`);
+  assert.ok(stats.renamed > 20, `expected many renamed locals, got ${stats.renamed}`);
+  for (const name of ["counter", "fib", "shadowParam", "makeThing", "packAll", "status"]) {
+    assert.ok(!code.includes(name), `local \`${name}\` survived renaming`);
+  }
+  const expected = await runFixture(original);
+  assert.ok(expected.includes("fib:55"), expected);
+  assert.ok(expected.includes("outerstatus:outer"), expected);
+
+  const words = sessionKeyWords("scope-secret", "scope", "c".repeat(32));
+  const keyHex = keyWordsToHex(words);
+  const { program } = compileVm(code, { keyWords: words, rng: makeRng(7) });
+  const decoded = await runObfuscated(program, keyHex);
+  assert.equal(decoded, expected);
+});
+
+await check("risky syntax is left alone instead of renamed wrongly", async () => {
+  const cases = {
+    repeat: ["local i=0 repeat local j=i i=i+1 until j>=2 print(i)", "repeat"],
+    label: ["::top:: local n=1 print(n) if n>0 then goto done end goto top ::done::", "::"],
+    annotation: ["local f = function(a: number): number return a end print(f(2))", "annotation"],
+    ifexpr: ["local a = if true then 1 else 2 print(a)", "ifexpr"],
+    interpolation: ['local name="x" print(`hi {name}`)', "interpolation"],
+  };
+  for (const [tag, [source, reason]] of Object.entries(cases)) {
+    const { stats } = obfuscateLua(source);
+    assert.equal(stats.renameSkipped, reason, `${tag}: expected bail-out, got ${stats.renameSkipped}`);
+  }
+});
+
+await check("short literals stay inline and long ones stay encrypted", async () => {
+  const { code, stats } = obfuscateLua('local sep=" " local dot="." local secret="super-secret-value" print(sep..dot..secret)');
+  assert.equal(stats.inlined, 2, `expected 2 inlined literals, got ${stats.inlined}`);
+  assert.ok(code.includes('" "'), "one-byte literal should stay readable");
+  assert.ok(!code.includes("super-secret-value"), "long literal must be encrypted");
+  assert.equal(stats.strings, 1, "only the long literal should take a table slot");
+});
+
+await check("repeated literals are hoisted once and still decode exactly", async () => {
+  const source = [
+    "local n = 0",
+    'for i = 1, 6 do n = n + #("hot-payload-value") end',
+    'print(n .. ":" .. string.sub("hot-payload-value", 1, 3))',
+  ].join("\n");
+  const { code, stats } = obfuscateLua(source);
+  assert.equal(stats.hoisted, 1, `expected one hoisted literal, got ${stats.hoisted}`);
+  assert.equal(stats.reused, 2, `both use sites should read the local, got ${stats.reused}`);
+  assert.ok(!code.includes("hot-payload-value"), "hoisting must not expose the plaintext");
+  assert.equal(await runFixture(code), await runFixture(source));
+});
+
+await check("the xor cipher runs without a bit32 library", async () => {
+  const source = 'local n = 0 for i = 1, 4 do n = n + #("xor-check") end print(n)';
+  const { code } = obfuscateLua(source, { rng: () => 0.1 });
+  assert.ok(code.includes("bit32 and bit32.bxor"), "xor cipher should carry a fallback");
+
+  // No BIT32_SHIM here: this is a stock Lua host with no bit32 at all.
+  const lua = await new LuaFactory().createEngine();
+  await lua.doString(harness);
+  const prints = [];
+  lua.global.set("__print", (line) => prints.push(String(line)));
+  lua.global.set("SRC", code);
+  await lua.doString("local f, err = load(SRC, '=nobit32'); if not f then error(err) end; f()");
+  lua.global.close();
+
+  assert.equal(prints.join("\n"), await runFixture(source));
+});
+
+await check("sha256 matches known vectors and the prefix state is exact", async () => {
+  const { lua } = await newEngine();
+  const sha = readFileSync("lua/sha.lua", "utf8");
+  await lua.doString(`${sha}
+V1 = sha256_hex("")
+V2 = sha256_hex("abc")
+V3 = sha256_hex(string.rep("a", 64))
+-- The proof-of-work path hashes a fixed head once and reuses the state for the
+-- variable tail; it must produce exactly the same digest as a plain hash.
+local splits = {
+  { "challenge:", "0" },
+  { string.rep("a", 64) .. ":", "1234" },
+  { string.rep("x", 60), string.rep("y", 20) },
+  { "", "tail" },
+}
+SPLIT_BAD = 0
+for i = 1, #splits do
+  local head, tail = splits[i][1], splits[i][2]
+  local h0, h1, h2, h3, h4, h5, h6, h7, done, rest = sha_prefix(head)
+  if sha_finish(h0, h1, h2, h3, h4, h5, h6, h7, done, rest .. tail) ~= sha256_hex(head .. tail) then
+    SPLIT_BAD = SPLIT_BAD + 1
+  end
+end`);
+
+  assert.equal(lua.global.get("V1"), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+  assert.equal(lua.global.get("V2"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+  assert.equal(
+    lua.global.get("V3"),
+    "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb",
+  );
+  assert.equal(lua.global.get("SPLIT_BAD"), 0, "prefix midstate digest differs from a plain hash");
 });
 
 await check("200KB payload compiles and decodes under budget", async () => {

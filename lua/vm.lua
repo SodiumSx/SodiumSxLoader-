@@ -1,138 +1,224 @@
 -- FreeHub Guard — VM runtime.
 -- Byte-for-byte twin of lib/crypto.mjs (ksSeg/mac) and lib/vm.mjs (program
 -- format). Executed inside the client, so it only uses bit32 + string + table.
+--
+-- Performance notes (measured, Lua 5.4 in WASM):
+--   * conts are decoded in one pass: base64 + keystream XOR folded together and
+--     flushed through string.char() in blocks instead of once per byte
+--   * the keystream is a xorshift word XORed with the key each round (no
+--     32-bit multiply in the hot loop)
+--   * instructions are parsed once into a flat numeric array, so the dispatch
+--     loop never touches string patterns again
 local vm_bit = bit32
 local vm_mod = 4294967296
 local vm_floor = math.floor
+local vm_byte = string.byte
+local vm_char = string.char
+local vm_sub = string.sub
+local vm_find = string.find
+local vm_gmatch = string.gmatch
+local vm_match = string.match
+local vm_concat = table.concat
+local vm_unpack = unpack or table.unpack
 
 local function vm_bxor(a, b)
   return vm_bit.bxor(a, b)
 end
 
-local function vm_x3(a, b, c)
-  return vm_bit.bxor(vm_bit.bxor(a, b), c)
-end
-
--- 32-bit multiply without floating point overflow.
+-- 32-bit multiply without floating point overflow (only used off the hot path).
 local function vm_imul(a, b)
   local ah = vm_floor(a / 65536)
   local al = a % 65536
   return (al * b + ((ah * b) % 65536) * 65536) % vm_mod
 end
 
-local function vm_xorshift(x)
-  x = vm_bxor(x, (x * 8192) % vm_mod)
-  x = vm_bxor(x, vm_floor(x / 131072))
-  x = vm_bxor(x, (x * 32) % vm_mod)
-  return x
-end
-
--- Mirrors ksSeg() in lib/crypto.mjs. Returns a byte array.
-local function vm_ks(k, seed, len)
-  local out = {}
-  local p, j = 1, 0
-  local base = vm_imul(seed + 1, 2654435761)
-  while p <= len do
-    local x = (k[1] + base) % vm_mod
-    x = vm_bxor(x, k[2])
-    x = vm_xorshift(x)
-    x = (x + vm_imul(j + 1, 2246822507)) % vm_mod
-    x = vm_bxor(x, k[3])
-    x = vm_xorshift(x)
-    x = vm_bxor(x, k[4])
-    out[p] = x % 256
-    out[p + 1] = vm_floor(x / 256) % 256
-    out[p + 2] = vm_floor(x / 65536) % 256
-    out[p + 3] = vm_floor(x / 16777216) % 256
-    p = p + 4
-    j = j + 1
-  end
-  return out
-end
-
 local vm_alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 local vm_b64map = {}
 for i = 1, 64 do
-  vm_b64map[string.byte(vm_alpha, i)] = i - 1
+  vm_b64map[vm_byte(vm_alpha, i)] = i - 1
 end
 
+-- Base64url decode of a plain constant (no keystream). Used by SETL.
 local function vm_b64(s)
-  local out, n = {}, 0
-  local acc, count = 0, 0
-  for i = 1, #s do
-    local c = vm_b64map[string.byte(s, i)]
-    if c then
-      acc = acc * 64 + c
-      count = count + 1
-      if count == 4 then
-        n = n + 1
-        out[n] = string.char(vm_floor(acc / 65536) % 256, vm_floor(acc / 256) % 256, acc % 256)
-        acc, count = 0, 0
-      end
+  local n = #s
+  local m = vm_b64map
+  local parts, pn = {}, 0
+  local buf, bn = {}, 0
+  local i = 1
+  local full = n - (n % 4)
+  while i <= full do
+    local v = ((m[vm_byte(s, i)] * 64 + m[vm_byte(s, i + 1)]) * 64
+      + m[vm_byte(s, i + 2)]) * 64 + m[vm_byte(s, i + 3)]
+    i = i + 4
+    buf[bn + 1] = vm_floor(v / 65536)
+    buf[bn + 2] = vm_floor(v / 256) % 256
+    buf[bn + 3] = v % 256
+    bn = bn + 3
+    if bn >= 45 then
+      pn = pn + 1
+      parts[pn] = vm_char(vm_unpack(buf, 1, bn))
+      buf, bn = {}, 0
     end
   end
-  if count == 2 then
-    n = n + 1
-    out[n] = string.char(vm_floor(acc / 16) % 256)
-  elseif count == 3 then
-    n = n + 1
-    out[n] = string.char(vm_floor(acc / 1024) % 256, vm_floor(acc / 4) % 256)
+  if i <= n then
+    local v = 0
+    local left = 0
+    while i <= n do
+      v = v * 64 + m[vm_byte(s, i)]
+      i = i + 1
+      left = left + 6
+    end
+    if left == 12 then
+      buf[bn + 1] = vm_floor(v / 16) % 256
+      bn = bn + 1
+    elseif left == 18 then
+      buf[bn + 1] = vm_floor(v / 1024) % 256
+      buf[bn + 2] = vm_floor(v / 4) % 256
+      bn = bn + 2
+    end
   end
-  return table.concat(out)
+  if bn > 0 then
+    pn = pn + 1
+    parts[pn] = vm_char(vm_unpack(buf, 1, bn))
+  end
+  return vm_concat(parts)
+end
+
+-- Keystream + base64 decode in a single pass.
+--
+-- The keystream word is xorshift32(t) ^ k[3], three bytes per word, which
+-- mirrors ksSeg() in lib/crypto.mjs exactly. Base64url groups are four chars
+-- for three bytes, so every iteration consumes one word and one group: no
+-- carry state, no intermediate string, and one string.char() call per block.
+local vm_blk = 60
+
+local function vm_unseal(raw, k, seed)
+  local n = #raw
+  local m = vm_b64map
+  local bx, by, ch, up = vm_bxor, vm_byte, string.char, vm_unpack
+  local k2, k3 = k[2], k[3]
+  local t = bx((k[1] + vm_imul(seed + 1, 2654435761)) % vm_mod, k2)
+  local parts, pn = {}, 0
+  local buf, bn = {}, 0
+  local i = 1
+  local full = n - (n % 4)
+  while i <= full do
+    local v = ((m[by(raw, i)] * 64 + m[by(raw, i + 1)]) * 64
+      + m[by(raw, i + 2)]) * 64 + m[by(raw, i + 3)]
+    i = i + 4
+    t = bx(t, (t * 8192) % vm_mod)
+    t = bx(t, vm_floor(t / 131072))
+    t = bx(t, (t * 32) % vm_mod)
+    t = bx(t, k3)
+    buf[bn + 1] = bx(vm_floor(v / 65536), t % 256)
+    buf[bn + 2] = bx(vm_floor(v / 256) % 256, vm_floor(t / 256) % 256)
+    buf[bn + 3] = bx(v % 256, vm_floor(t / 65536) % 256)
+    bn = bn + 3
+    if bn >= vm_blk then
+      pn = pn + 1
+      parts[pn] = ch(up(buf, 1, bn))
+      buf, bn = {}, 0
+    end
+  end
+  if i <= n then
+    -- 2 or 3 leftover chars: 1 or 2 plaintext bytes from the next word.
+    local v, left = 0, 0
+    while i <= n do
+      v = v * 64 + m[by(raw, i)]
+      i = i + 1
+      left = left + 6
+    end
+    t = bx(t, (t * 8192) % vm_mod)
+    t = bx(t, vm_floor(t / 131072))
+    t = bx(t, (t * 32) % vm_mod)
+    t = bx(t, k3)
+    if left == 12 then
+      buf[bn + 1] = bx(vm_floor(v / 16) % 256, t % 256)
+      bn = bn + 1
+    elseif left == 18 then
+      buf[bn + 1] = bx(vm_floor(v / 1024) % 256, t % 256)
+      buf[bn + 2] = bx(vm_floor(v / 4) % 256, vm_floor(t / 256) % 256)
+      bn = bn + 2
+    end
+  end
+  if bn > 0 then
+    pn = pn + 1
+    parts[pn] = ch(up(buf, 1, bn))
+  end
+  return vm_concat(parts)
 end
 
 local function vm_key(hex)
   local k = {}
   for i = 0, 3 do
     local o = i * 8
-    local b1 = tonumber(hex:sub(o + 1, o + 2), 16) or 0
-    local b2 = tonumber(hex:sub(o + 3, o + 4), 16) or 0
-    local b3 = tonumber(hex:sub(o + 5, o + 6), 16) or 0
-    local b4 = tonumber(hex:sub(o + 7, o + 8), 16) or 0
+    local b1 = tonumber(vm_sub(hex, o + 1, o + 2), 16) or 0
+    local b2 = tonumber(vm_sub(hex, o + 3, o + 4), 16) or 0
+    local b3 = tonumber(vm_sub(hex, o + 5, o + 6), 16) or 0
+    local b4 = tonumber(vm_sub(hex, o + 7, o + 8), 16) or 0
     k[i + 1] = b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
   end
   return k
 end
 
-local function vm_unseal(data, k, seed)
-  local n = #data
-  local stream = vm_ks(k, seed, n)
-  local out = {}
-  for i = 1, n do
-    out[i] = string.char(vm_bxor(string.byte(data, i), stream[i]))
+local vm_hexmap = "0123456789abcdef"
+
+local function vm_hex8(x)
+  local buf = {}
+  for i = 8, 1, -1 do
+    local nib = x % 16
+    buf[i] = vm_sub(vm_hexmap, nib + 1, nib + 1)
+    x = vm_floor(x / 16)
   end
-  return table.concat(out)
+  return vm_concat(buf)
 end
 
--- Keyed tamper check. Mirrors mac() in lib/crypto.mjs.
+-- Keyed tamper check: four polynomial lanes over every byte, folded twice.
+-- Mirrors mac() in lib/crypto.mjs. 65599 * (2^32-1) is exactly representable,
+-- so doubles and integers agree to the last bit.
 local function vm_mac(data, k)
-  local lanes = {
-    vm_bxor(2166136261, k[1]),
-    vm_bxor(16777619, k[2]),
-    vm_bxor(2654435769, k[3]),
-    vm_bxor(2246822507, k[4]),
-  }
-  for i = 1, #data do
-    local lane = (i - 1) % 4 + 1
-    lanes[lane] = vm_imul(vm_bxor(lanes[lane], string.byte(data, i)), 16777619)
+  local h1 = vm_bxor(2166136261, k[1])
+  local h2 = vm_bxor(16777619, k[2])
+  local h3 = vm_bxor(2654435769, k[3])
+  local h4 = vm_bxor(2246822507, k[4])
+  local n = #data
+  local by = vm_byte
+  local full = n - (n % 4)
+  local i = 1
+  while i <= full do
+    local a, b, c, d = by(data, i, i + 3)
+    h1 = (h1 * 65599 + a) % vm_mod
+    h2 = (h2 * 65599 + b) % vm_mod
+    h3 = (h3 * 65599 + c) % vm_mod
+    h4 = (h4 * 65599 + d) % vm_mod
+    i = i + 4
   end
-  for _ = 1, 3 do
-    for i = 1, 4 do
-      local nxt = lanes[i % 4 + 1]
-      lanes[i] = vm_imul(vm_bxor(lanes[i], vm_bit.lrotate(nxt, 13)), 2246822507)
+  while i <= n do
+    local lane = (i - 1) % 4
+    local b = by(data, i)
+    if lane == 0 then
+      h1 = (h1 * 65599 + b) % vm_mod
+    elseif lane == 1 then
+      h2 = (h2 * 65599 + b) % vm_mod
+    elseif lane == 2 then
+      h3 = (h3 * 65599 + b) % vm_mod
+    else
+      h4 = (h4 * 65599 + b) % vm_mod
     end
+    i = i + 1
   end
-  local parts = {}
-  for i = 1, 4 do
-    local x, buf = lanes[i], {}
-    for b = 8, 1, -1 do
-      buf[b] = string.sub("0123456789abcdef", x % 16 + 1, x % 16 + 1)
-      x = vm_floor(x / 16)
-    end
-    parts[i] = table.concat(buf)
+  h4 = (h4 + n) % vm_mod
+  for _ = 1, 2 do
+    local t1, t2, t3, t4 = h1, h2, h3, h4
+    h1 = (h1 * 65599 + t2) % vm_mod
+    h2 = (h2 * 65599 + t3) % vm_mod
+    h3 = (h3 * 65599 + t4) % vm_mod
+    h4 = (h4 * 65599 + t1) % vm_mod
   end
-  return table.concat(parts)
-end-- Native runner + guard live inside the VM so the delivered stub has no
+  return vm_hex8(h1) .. vm_hex8(h2) .. vm_hex8(h3) .. vm_hex8(h4)
+end
+
+-- Native runner + guard live inside the VM so the delivered stub has no
 -- top-level "decode then load" line to patch. `vm_native` rejects any loader or
 -- string helper that was replaced by a Lua closure (env loggers, hook tools).
 local vm_load = loadstring or load
@@ -167,102 +253,106 @@ end
 
 local vm_run
 
-vm_run = function (program, keyhex, maxSteps, depth)
-  depth = depth or 1
+-- Flat instruction array: five slots per instruction (opcode + four args).
+local function vm_parse(codeText, rev)
+  local ins, count = {}, 0
+  for line in vm_gmatch(codeText, "[^;]+") do
+    local a, b, c, d, e = vm_match(line, "^(%d+),(%d+),?(%d*),?(%d*),?(%d*)$")
+    local o = count * 5
+    count = count + 1
+    ins[o + 1] = rev[tonumber(a) or -1]
+    ins[o + 2] = tonumber(b) or 0
+    ins[o + 3] = tonumber(c) or 0
+    ins[o + 4] = tonumber(d) or 0
+    ins[o + 5] = tonumber(e) or 0
+  end
+  return ins, count
+end
+
+local function vm_step(program, keyhex, maxSteps, depth)
   if depth > 6 then return nil end
   if type(program) ~= "string" or type(keyhex) ~= "string" or #keyhex < 32 then
     return nil
   end
-  local n1 = string.find(program, "\n", 1, true)
+  local n1 = vm_find(program, "\n", 1, true)
   if not n1 then return nil end
-  local n2 = string.find(program, "\n", n1 + 1, true)
+  local n2 = vm_find(program, "\n", n1 + 1, true)
   if not n2 then return nil end
-  local head = string.sub(program, 1, n1 - 1)
-  local constsText = string.sub(program, n1 + 1, n2 - 1)
-  local codeText = string.sub(program, n2 + 1)
+  local head = vm_sub(program, 1, n1 - 1)
+  local constsText = vm_sub(program, n1 + 1, n2 - 1)
+  local codeText = vm_sub(program, n2 + 1)
 
-  local permText, regText = string.match(head, "^(.-)|(%d+)$")
+  local permText, regText = vm_match(head, "^(.-)|(%d+)$")
   if not permText then return nil end
 
   local rev, internal = {}, 0
-  for num in string.gmatch(permText, "%d+") do
+  for num in vm_gmatch(permText, "%d+") do
     rev[tonumber(num)] = internal
     internal = internal + 1
   end
 
   local consts, ci = {}, 0
-  for c in string.gmatch(constsText, "[^,]+") do
+  for c in vm_gmatch(constsText, "[^,]+") do
     ci = ci + 1
     consts[ci] = c
   end
 
-  local code, count = {}, 0
-  for line in string.gmatch(codeText, "[^;]+") do
-    count = count + 1
-    code[count] = line
-  end
+  local ins, count = vm_parse(codeText, rev)
+  if count == 0 then return nil end
 
   local key = vm_key(keyhex)
   local regs = {}
-  local pc = 1
-  local steps = 0
+  local pc, steps = 1, 0
   local limit = maxSteps or (count * 16 + 200000)
 
   while true do
     steps = steps + 1
-    if steps > limit then return nil end
-    local line = code[pc]
-    if not line then return nil end
+    if steps > limit or pc < 1 or pc > count then return nil end
 
-    local f, fc = {}, 0
-    for part in string.gmatch(line, "[^,]+") do
-      fc = fc + 1
-      f[fc] = tonumber(part)
-    end
-    if fc < 2 then return nil end
-    local op = rev[f[1]]
+    local o = (pc - 1) * 5
+    local op = ins[o + 1]
+    local a, b, c, d = ins[o + 2], ins[o + 3], ins[o + 4], ins[o + 5]
     local nextpc = pc + 1
 
     if op == 0 then
-      local idx = f[3]
-      local raw = consts[idx]
+      local raw = consts[b]
       if not raw then return nil end
-      regs[f[2]] = vm_unseal(vm_b64(raw), key, idx - 1)
+      regs[a] = vm_unseal(raw, key, b - 1)
     elseif op == 1 then
-      local raw = consts[f[3]]
+      local raw = consts[b]
       if not raw then return nil end
-      regs[f[2]] = vm_b64(raw)
+      regs[a] = vm_b64(raw)
     elseif op == 2 then
-      regs[f[2]] = regs[f[3]]
+      regs[a] = regs[b]
     elseif op == 3 then
-      regs[f[2]] = regs[f[3]] .. regs[f[4]]
+      regs[a] = regs[b] .. regs[c]
     elseif op == 4 then
-      local a, b = regs[f[3]], regs[f[4]]
-      if type(a) ~= "string" or type(b) ~= "string" or #b == 0 then return nil end
-      local out, lb = {}, #b
-      for i = 1, #a do
-        out[i] = string.char(vm_bxor(string.byte(a, i), string.byte(b, (i - 1) % lb + 1)))
+      local x, y = regs[b], regs[c]
+      if type(x) ~= "string" or type(y) ~= "string" or #y == 0 then return nil end
+      local out, lb, n = {}, #y, #x
+      for i = 1, n do
+        out[i] = vm_char(vm_bxor(vm_byte(x, i), vm_byte(y, (i - 1) % lb + 1)))
       end
-      regs[f[2]] = table.concat(out)
+      regs[a] = vm_concat(out)
     elseif op == 5 then
-      local a = regs[f[3]]
-      if type(a) ~= "string" then return nil end
-      regs[f[2]] = string.sub(a, f[4] + 1, f[4] + f[5])
+      local x = regs[b]
+      if type(x) ~= "string" then return nil end
+      regs[a] = vm_sub(x, c + 1, c + d)
     elseif op == 6 then
-      local a = regs[f[3]]
-      if type(a) ~= "string" then return nil end
-      regs[f[2]] = string.reverse(a)
+      local x = regs[b]
+      if type(x) ~= "string" then return nil end
+      regs[a] = string.reverse(x)
     elseif op == 7 then
-      regs[f[2]] = f[3]
+      regs[a] = b
     elseif op == 8 then
-      nextpc = f[2]
+      nextpc = a
     elseif op == 9 then
-      if regs[f[2]] then nextpc = f[3] end
+      if regs[a] then nextpc = b end
     elseif op == 10 then
-      return regs[f[2]]
+      return regs[a]
     elseif op == 11 then
       -- EXEC: run the decoded source inside the VM and never hand it back.
-      local src = regs[f[2]]
+      local src = regs[a]
       if type(src) ~= "string" or #src < 24 then return nil end
       if not vm_native(vm_load) then return nil end
       local ok, fn = pcall(vm_load, src, vm_chunkname())
@@ -271,17 +361,24 @@ vm_run = function (program, keyhex, maxSteps, depth)
       return "\1"
     elseif op == 12 then
       -- NEST: run the embedded program with a key derived from parent key + salt.
-      local sub = regs[f[2]]
-      local salt = regs[f[3]]
+      local sub, salt = regs[a], regs[b]
       if type(sub) ~= "string" or type(salt) ~= "string" then return nil end
-      local childKey = vm_mac(salt, key)
-      return vm_run(sub, childKey, nil, depth + 1)
+      return vm_run(sub, vm_mac(salt, key), nil, depth + 1)
     else
       return nil
     end
 
     pc = nextpc
   end
+end
+
+-- Public entry point. Every failure mode (bad program, hooked natives, corrupt
+-- const) returns nil instead of raising, so a tampered delivery can never turn
+-- into an "attempt to call a nil value" in the console.
+vm_run = function (program, keyhex, maxSteps, depth)
+  local ok, result = pcall(vm_step, program, keyhex, maxSteps, depth or 1)
+  if ok then return result end
+  return nil
 end
 
 -- Entry point used by the raw link. Fails closed: a hooked loadstring/string

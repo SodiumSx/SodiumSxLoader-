@@ -89,11 +89,16 @@ local function core_zeroBits(hex)
 end
 
 local function core_solve(challenge, bits)
+  -- The challenge prefix is fixed for every attempt, and it is exactly one
+  -- SHA-256 block long, so its compression is done once here instead of once
+  -- per hash. That halves the cost of the whole proof-of-work grind.
   local prefix = challenge .. ":"
+  local h0, h1, h2, h3, h4, h5, h6, h7, done, rest = sha_prefix(prefix)
   local limit = 2 ^ bits + (2 ^ bits) * 4
   if limit > 4000000 then limit = 4000000 end
   for w = 0, limit do
-    if core_zeroBits(sha256_hex(prefix .. w)) >= bits then return w end
+    local hex = sha_finish(h0, h1, h2, h3, h4, h5, h6, h7, done, rest .. w)
+    if core_zeroBits(hex) >= bits then return w end
   end
   return nil
 end
@@ -113,37 +118,39 @@ local function core_invoke(src)
     local ok, g = pcall(getgenv)
     if ok and type(g) == "table" then real = g end
   end
+  if type(real) ~= "table" then real = _G end
 
-  local private = {}
-  local env
-  env = setmetatable({}, {
-    __index = function(_, k)
-      local v = private[k]
-      if v ~= nil then return v end
-      return real[k]
-    end,
-    __newindex = function(_, k, v)
-      private[k] = v
+  -- Sandbox with a *table* fallback instead of a function.
+  --
+  -- `__index = real` means reading an untouched global is one C-level table
+  -- lookup; the previous version routed every global read through a Lua
+  -- closure, which is a real cost in a payload that polls in a loop. Writes
+  -- land in the sandbox table itself (via __newindex on the first write, and
+  -- directly afterwards), so they shadow the real environment without ever
+  -- touching it.
+  local env = setmetatable({}, {
+    __index = real,
+    __newindex = function(t, k, v)
+      rawset(t, k, v)
     end,
     __metatable = false,
     __tostring = function() return "env" end,
   })
 
-  private.getgenv = function() return private end
-  private.getfenv = function() return env end
-  private.getrenv = function() return real end
-  private.setfenv = function(f) return f end
-  private.require = real.require
+  rawset(env, "getgenv", function() return env end)
+  rawset(env, "getfenv", function() return env end)
+  rawset(env, "getrenv", function() return real end)
+  rawset(env, "setfenv", function(f) return f end)
 
   if type(setfenv) == "function" then
     pcall(setfenv, fn, env)
   end
   local okRun, runErr = pcall(fn)
   -- Hub authors can opt into script errors with __FREEHUB_DEBUG = true.
-  if not okRun and private.__FREEHUB_DEBUG == true then
+  if not okRun and rawget(env, "__FREEHUB_DEBUG") == true then
     pcall(function() print("[FreeHub] script error: " .. tostring(runErr)) end)
   end
-  private = nil
+  env = nil
   return okRun
 end
 
